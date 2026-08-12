@@ -24,13 +24,13 @@ const ManagerDashboard = () => {
           },
         };
 
-        const { data: matches } = await axios.get('https://fantacyleauge.com/api/matches', config);
+        const { data: matches } = await axios.get('/api/matches', config);
 
         // Fetch groups and bets for each match
         const matchesWithBets = await Promise.all(matches.map(async (match) => {
-          const { data: groups } = await axios.get(`https://fantacyleauge.com/api/groups/match/${match._id}`, config);
+          const { data: groups } = await axios.get(`/api/groups/match/${match._id}`, config);
           const hasBets = await Promise.all(groups.map(async (group) => {
-            const { data: bets } = await axios.get(`https://fantacyleauge.com/api/bets/group/${group._id}`, config);
+            const { data: bets } = await axios.get(`/api/bets/group/${group._id}`, config);
             return bets.length > 0;
           }));
           return { ...match, hasBets: hasBets.some(hasBet => hasBet) };
@@ -63,7 +63,7 @@ const ManagerDashboard = () => {
   //       },
   //     };
 
-  //     const { data: clubData } = await axios.get(`https://fantacyleauge.com/api/clubs/${clubId}`, config);
+  //     const { data: clubData } = await axios.get(`/api/clubs/${clubId}`, config);
   //     setClub(clubData);
   //   } catch (error) {
   //     toast.error(error.response?.data?.message || 'Failed to fetch club details');
@@ -75,7 +75,7 @@ const ManagerDashboard = () => {
       <ToastContainer />
       <img id="Leftbanner1" src="/assets/ManagerBanner.png" alt="MemberBanner" />
 
-      <div class="d-flex justify-content-center align-items-center MainDataTitle my-4" bis_skin_checked="1"><h1>Your Matches ({club.clubName})</h1></div>
+      <div className="d-flex justify-content-center align-items-center MainDataTitle my-4"><h1>Your Matches ({club.clubName})</h1></div>
       
       {loading ? (
         <p>Loading...</p>
@@ -84,7 +84,7 @@ const ManagerDashboard = () => {
           <p className="text-center my-4">No Matches Added To Your Club.</p>
 
           <div className="ManageBtn W-100 d-flex justify-content-center">
-            <button class="bet-button" onClick={() => navigate(`/manager-dashboard/add-match`) }>Add Match</button>
+            <button className="bet-button" onClick={() => navigate(`/manager-dashboard/add-match`) }>Add Match</button>
           </div>
         </>
 
@@ -115,7 +115,7 @@ const ManagerDashboard = () => {
         </div>
 
         <div className="ManageBtn W-100 d-flex justify-content-center">
-          <button class="bet-button" onClick={() => navigate(`/manager-dashboard/Manage-Matches`) }>Add/Manage Matches</button>
+          <button className="bet-button" onClick={() => navigate(`/manager-dashboard/Manage-Matches`) }>Add/Manage Matches</button>
         </div>
       </>
       )}

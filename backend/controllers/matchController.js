@@ -278,8 +278,56 @@ const deleteMatch = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to delete this match');
   }
 
-  await prisma.match.delete({ where: { id: matchId } });
-  res.json({ message: 'Match deleted successfully' });
+  // Cascade delete the match and refund any OPEN (unsettled) bets. A bet is
+  // open when its result is still null — settled Win/Loss bets were already
+  // paid out during prize distribution, so their stakes must not be refunded.
+  // Order matters: refund first, then detach the match's own result pointer
+  // (Match.result is a NoAction FK), then remove bets and winner records (which
+  // reference the groups), then the groups and results, then the match itself.
+  let totalRefunded = 0;
+  let refundedBets = 0;
+
+  await prisma.$transaction(async (tx) => {
+    const openBets = await tx.bet.findMany({
+      where: { match: matchId, result: null },
+      select: { better: true, betAmount: true },
+    });
+
+    const refundByUser = {};
+    for (const bet of openBets) {
+      refundByUser[bet.better] = (refundByUser[bet.better] || 0) + bet.betAmount;
+    }
+    refundedBets = openBets.length;
+
+    for (const [userId, amount] of Object.entries(refundByUser)) {
+      if (amount <= 0) continue;
+      totalRefunded += amount;
+      await tx.user.update({ where: { id: userId }, data: { credits: { increment: amount } } });
+      await tx.transaction.create({
+        data: {
+          id: require('crypto').randomUUID(),
+          transactionId: `REFUND-${require('crypto').randomUUID()}`,
+          user: userId,
+          amount,
+          type: 'Credit',
+          description: `Refund for open bet(s) on deleted match ${match.team1} vs ${match.team2}`,
+        },
+      });
+    }
+
+    await tx.match.update({ where: { id: matchId }, data: { result: null } });
+    await tx.bet.deleteMany({ where: { match: matchId } });
+    await tx.winners.deleteMany({ where: { match: matchId } });
+    await tx.group.deleteMany({ where: { match: matchId } });
+    await tx.result.deleteMany({ where: { match: matchId } });
+    await tx.match.delete({ where: { id: matchId } });
+  }, { maxWait: 10000, timeout: 30000 });
+
+  res.json({
+    message: 'Match and its groups, bets and results were deleted successfully',
+    refundedBets,
+    totalRefunded,
+  });
 });
 
 // @desc    Get all matches for a club (for members)
@@ -352,7 +400,12 @@ const approveCredits = asyncHandler(async (req, res) => {
       manager: { queued: 0, failed: 0 },
       users: { queued: 0, failed: 0 }
     };
-    
+
+    // WhatsApp messages are collected during the DB transaction and only
+    // enqueued after it commits, so a rollback never notifies anyone about
+    // money that was ultimately not moved.
+    const pendingNotifications = [];
+
     const generateMsgId = () => {
       return Math.random().toString(36).substring(2, 10).toUpperCase();
     };
@@ -367,23 +420,31 @@ const approveCredits = asyncHandler(async (req, res) => {
 📊 *Final Results:*
     `.trim();
 
+    // Every balance change for the whole match happens inside ONE transaction.
+    // If anything throws mid-distribution the entire payout rolls back, so
+    // credits are never left partially distributed while prizeShareStatus stays
+    // false (a state the pre-check guard would otherwise refuse to retry).
+    await prisma.$transaction(async (tx) => {
     for (let i = 0; i < groups.length; i++) {
       const group = groups[i];
       const groupNumber = i + 1;
-      const bets = await prisma.bet.findMany({
+      const bets = await tx.bet.findMany({
         where: { group: group.id },
         include: { User: true }
       });
 
       bets.sort((a, b) => b.score - a.score);
 
-      const firstPlaceScore = bets[0]?.score || 0;
-      const secondPlaceScore = bets.find((bet) => bet.score < firstPlaceScore)?.score || 0;
-      const thirdPlaceScore = bets.find((bet) => bet.score < secondPlaceScore)?.score || 0;
+      // Rank by DISTINCT score so a missing tier stays empty instead of
+      // collapsing to 0. The old `|| 0` fallback meant that when fewer than
+      // three distinct scores existed (e.g. everyone tied), the 2nd/3rd place
+      // scores became 0 and any bet that genuinely scored 0 was paid a prize.
+      const distinctScores = [...new Set(bets.map((bet) => bet.score))].sort((a, b) => b - a);
+      const [firstPlaceScore, secondPlaceScore, thirdPlaceScore] = distinctScores;
 
-      const firstWinners = bets.filter((bet) => bet.score === firstPlaceScore);
-      const secondWinners = bets.filter((bet) => bet.score === secondPlaceScore);
-      const thirdWinners = bets.filter((bet) => bet.score === thirdPlaceScore);
+      const firstWinners = firstPlaceScore !== undefined ? bets.filter((bet) => bet.score === firstPlaceScore) : [];
+      const secondWinners = secondPlaceScore !== undefined ? bets.filter((bet) => bet.score === secondPlaceScore) : [];
+      const thirdWinners = thirdPlaceScore !== undefined ? bets.filter((bet) => bet.score === thirdPlaceScore) : [];
 
       const totalBetAmount = group.totalBetAmount || 0;
       const firstPrize = (totalBetAmount * (group.winnerShare1 || 0)) / 100;
@@ -399,13 +460,13 @@ const approveCredits = asyncHandler(async (req, res) => {
       resultsMessage += `
 
 🔹 *Group ${groupNumber} Results:*
-🥇 *1st Place (Score: ${firstPlaceScore}):*
+🥇 *1st Place (Score: ${firstPlaceScore ?? '-'}):*
        ${firstWinners.length > 0 ? formatWinners(firstWinners, firstPrize / firstWinners.length) : 'No winners'}
-       
-🥈 *2nd Place (Score: ${secondPlaceScore}):*
+
+🥈 *2nd Place (Score: ${secondPlaceScore ?? '-'}):*
        ${secondWinners.length > 0 ? formatWinners(secondWinners, secondPrize / secondWinners.length) : 'No winners'}
-       
-🥉 *3rd Place (Score: ${thirdPlaceScore}):*
+
+🥉 *3rd Place (Score: ${thirdPlaceScore ?? '-'}):*
        ${thirdWinners.length > 0 ? formatWinners(thirdWinners, thirdPrize / thirdWinners.length) : 'No winners'}
       `.trim();
 
@@ -416,23 +477,23 @@ const approveCredits = asyncHandler(async (req, res) => {
           for (const winner of winners) {
             if (!winner.User || !winner.User.id) continue;
             
-            const user = await prisma.user.findUnique({ where: { id: winner.User.id } });
+            const user = await tx.user.findUnique({ where: { id: winner.User.id } });
             if (!user) continue;
 
             let referralBonus = 0;
             let netWinnings = amountPerWinner;
-            
+
             if (user.referredBy && user.userType === 'Member') {
               referralBonus = amountPerWinner * 0.05;
               netWinnings = amountPerWinner - referralBonus;
-              
-              await prisma.user.update({
+
+              await tx.user.update({
                 where: { id: user.id },
                 data: { credits: { increment: netWinnings } }
               });
 
               const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-              const winnerTransaction = await prisma.transaction.create({
+              const winnerTransaction = await tx.transaction.create({
                 data: {
                   id: require('crypto').randomUUID(),
                   transactionId: txnCode,
@@ -443,9 +504,9 @@ const approveCredits = asyncHandler(async (req, res) => {
                 }
               });
 
-              const referrer = await prisma.user.findUnique({ where: { id: user.referredBy } });
+              const referrer = await tx.user.findUnique({ where: { id: user.referredBy } });
               if (referrer) {
-                await prisma.user.update({
+                await tx.user.update({
                   where: { id: referrer.id },
                   data: {
                     credits: { increment: referralBonus },
@@ -454,7 +515,7 @@ const approveCredits = asyncHandler(async (req, res) => {
                 });
 
                 const refTxnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-                await prisma.transaction.create({
+                await tx.transaction.create({
                   data: {
                     id: require('crypto').randomUUID(),
                     transactionId: refTxnCode,
@@ -482,16 +543,21 @@ const approveCredits = asyncHandler(async (req, res) => {
                 })}
                 `.trim();
 
-                await addToWhatsappQueue(referrer.countryCode || '+91', referrer.phoneNumber, referrerMessage);
+                pendingNotifications.push({
+                  countryCode: referrer.countryCode || '+91',
+                  phoneNumber: referrer.phoneNumber,
+                  message: referrerMessage,
+                  category: 'winners'
+                });
               }
             } else {
-              await prisma.user.update({
+              await tx.user.update({
                 where: { id: user.id },
                 data: { credits: { increment: amountPerWinner } }
               });
 
               const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-              const winnerTransaction = await prisma.transaction.create({
+              const winnerTransaction = await tx.transaction.create({
                 data: {
                   id: require('crypto').randomUUID(),
                   transactionId: txnCode,
@@ -530,14 +596,18 @@ const approveCredits = asyncHandler(async (req, res) => {
             })}
             `.trim();
 
-            try {
-              await addToWhatsappQueue(user.countryCode || '+91', user.phoneNumber, winnerMessage);
-              await addToWhatsappQueue(user.countryCode || '+91', user.phoneNumber, creditMessage);
-              notificationQueueResults.winners.queued += 2;
-            } catch (error) {
-              console.error(`Failed to queue notifications for winner ${user.phoneNumber}:`, error);
-              notificationQueueResults.winners.failed += 2;
-            }
+            pendingNotifications.push({
+              countryCode: user.countryCode || '+91',
+              phoneNumber: user.phoneNumber,
+              message: winnerMessage,
+              category: 'winners'
+            });
+            pendingNotifications.push({
+              countryCode: user.countryCode || '+91',
+              phoneNumber: user.phoneNumber,
+              message: creditMessage,
+              category: 'winners'
+            });
           }
         }
       };
@@ -547,13 +617,13 @@ const approveCredits = asyncHandler(async (req, res) => {
       await distributePrize(thirdWinners, thirdPrize, "3rd");
 
       for (const winner of firstWinners) {
-        await prisma.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
+        await tx.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
       }
       for (const winner of secondWinners) {
-        await prisma.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
+        await tx.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
       }
       for (const winner of thirdWinners) {
-        await prisma.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
+        await tx.bet.update({ where: { id: winner.id }, data: { result: 'Win' } });
       }
 
       const losers = bets.filter(
@@ -563,10 +633,10 @@ const approveCredits = asyncHandler(async (req, res) => {
           bet.score !== thirdPlaceScore
       );
       for (const loser of losers) {
-        await prisma.bet.update({ where: { id: loser.id }, data: { result: 'Loss' } });
+        await tx.bet.update({ where: { id: loser.id }, data: { result: 'Loss' } });
       }
 
-      await prisma.winners.create({
+      await tx.winners.create({
         data: {
           id: require('crypto').randomUUID(),
           match: matchId,
@@ -607,13 +677,13 @@ const approveCredits = asyncHandler(async (req, res) => {
       const managerShare = remainingAmount - adminShare;
 
       if (adminShare > 0 && admin) {
-        await prisma.user.update({
+        await tx.user.update({
           where: { id: admin.id },
           data: { credits: { increment: adminShare } }
         });
 
         const adminTxnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-        await prisma.transaction.create({
+        await tx.transaction.create({
           data: {
             id: require('crypto').randomUUID(),
             transactionId: adminTxnCode,
@@ -626,13 +696,13 @@ const approveCredits = asyncHandler(async (req, res) => {
       }
 
       if (managerShare > 0 && manager) {
-        await prisma.user.update({
+        await tx.user.update({
           where: { id: manager.id },
           data: { credits: { increment: managerShare } }
         });
 
         const mgrTxnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-        await prisma.transaction.create({
+        await tx.transaction.create({
           data: {
             id: require('crypto').randomUUID(),
             transactionId: mgrTxnCode,
@@ -645,6 +715,19 @@ const approveCredits = asyncHandler(async (req, res) => {
       }
     }
 
+      // Atomically claim the match. If a concurrent request already distributed
+      // (prizeShareStatus is now true), this matches 0 rows and we throw, rolling
+      // back this transaction's duplicate payouts.
+      const claimed = await tx.match.updateMany({
+        where: { id: matchId, prizeShareStatus: false },
+        data: { status: 'Announced', prizeShareStatus: true }
+      });
+      if (claimed.count === 0) {
+        throw new Error('Prize distribution already completed for this match');
+      }
+    }, { maxWait: 15000, timeout: 120000 });
+
+    // ---- Post-commit: balances are settled; now fan out notifications ----
     resultsMessage += `
 
 🎉 *Congratulations to all winners!*
@@ -655,7 +738,7 @@ Thank you for participating in ${match.Club ? match.Club.clubName : ''}'s fantas
 🔗 *Dashboard:* https://fantacyleauge.com/dashboard
     `.trim();
 
-    const userNotificationPromises = allUsers.map(async (user) => {
+    for (const user of allUsers) {
       const msgId = generateMsgId();
       const personalizedMessage = `
 Hi ${user.firstName} ${user.lastName},
@@ -664,24 +747,23 @@ ${resultsMessage}
 
 msgid: ${msgId}
       `.trim();
+      pendingNotifications.push({
+        countryCode: user.countryCode || '+91',
+        phoneNumber: user.phoneNumber,
+        message: personalizedMessage,
+        category: 'users'
+      });
+    }
 
+    for (const n of pendingNotifications) {
       try {
-        await addToWhatsappQueue(user.countryCode || '+91', user.phoneNumber, personalizedMessage);
-        notificationQueueResults.users.queued += 1;
-        return { success: true, phoneNumber: user.phoneNumber };
+        await addToWhatsappQueue(n.countryCode, n.phoneNumber, n.message);
+        notificationQueueResults[n.category].queued += 1;
       } catch (error) {
-        console.error(`Failed to queue results notification for ${user.phoneNumber}:`, error);
-        notificationQueueResults.users.failed += 1;
-        return { success: false, phoneNumber: user.phoneNumber, error: error.message };
+        console.error(`Failed to queue notification for ${n.phoneNumber}:`, error);
+        notificationQueueResults[n.category].failed += 1;
       }
-    });
-
-    await Promise.all(userNotificationPromises);
-
-    await prisma.match.update({
-      where: { id: matchId },
-      data: { status: 'Announced', prizeShareStatus: true }
-    });
+    }
 
     res.json({
       success: true,
@@ -696,9 +778,10 @@ msgid: ${msgId}
 
   } catch (error) {
     console.error("Error approving credits:", error);
-    res.status(500).json({
+    const alreadyDone = /already completed/i.test(error.message || '');
+    res.status(alreadyDone ? 409 : 500).json({
       success: false,
-      error: "Internal Server Error",
+      error: alreadyDone ? error.message : "Internal Server Error",
       details: error.message
     });
   }

@@ -24,7 +24,7 @@ const AdminDashboard = () => {
             'Authorization': `Bearer ${userInfo.token}`,
           },
         };
-        const { data } = await axios.get('https://fantacyleauge.com/api/users/', config);
+        const { data } = await axios.get('/api/users/', config);
         setUsers(data);
       } catch (error) {
         console.error('Error fetching users:', error);
@@ -42,7 +42,7 @@ const AdminDashboard = () => {
   return (
     <AdminLayout>
       <img id="Leftbanner1" src="/assets/AdminBanner.png" alt="MemberBanner" />
-      <div class="d-flex justify-content-center align-items-center MainDataTitle my-4" bis_skin_checked="1"><h1>Users List</h1></div>
+      <div className="d-flex justify-content-center align-items-center MainDataTitle my-4"><h1>Users List</h1></div>
 
       
         <div className='Resultcards'>

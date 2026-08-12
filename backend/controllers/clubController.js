@@ -1,7 +1,7 @@
 const asyncHandler = require("express-async-handler");
 const prisma = require("../config/prisma");
 const bcrypt = require("bcryptjs");
-const axios = require('axios');
+const { addToWhatsappQueue } = require('../services/queueService');
 
 // @desc    Add a new club
 // @route   POST /api/clubs
@@ -64,12 +64,8 @@ const addClub = asyncHandler(async (req, res) => {
 
     console.log("Club created successfully!", club);
 
-    // Remove '+' from countryCode if it exists
-    const cleanedCountryCode = countryCode.replace('+', '');
-
-    // Send WhatsApp Message
-    const receiverNumber = `${cleanedCountryCode}${managerPhone}`;
-
+    // Notify the new manager. WhatsApp notifications are currently disabled, so
+    // addToWhatsappQueue is a no-op shim (see services/queueService.js).
     const message = `
 ### **1️⃣ 🎉 Welcome to FantasyLeague7!**
 
@@ -84,19 +80,7 @@ const addClub = asyncHandler(async (req, res) => {
 🏏 Lead your team to victory and dominate the league!
     `.trim();
 
-    const whatsappData = {
-      appkey: 'fef8a455-a06c-46f4-b2fd-1c71f173f95e',
-      authkey: 'zgWIgQmncta53mAurWa6WPRk7KI3BjMSqiX10HaBPPW67U9p3s',
-      to: receiverNumber,
-      message: message,
-    };
-
-    try {
-      const whatsappResponse = await axios.post('https://websender.eappcloud.in/api/create-message', whatsappData);
-      console.log("WhatsApp Message Sent Successfully:", whatsappResponse.data);
-    } catch (waError) {
-      console.error("Failed to Send WhatsApp Message:", waError.response?.data || waError.message);
-    }
+    await addToWhatsappQueue(countryCode, managerPhone, message);
 
     res.status(201).json({ message: "Club added successfully!", club: { ...club, _id: club.id } });
   } catch (error) {
@@ -212,12 +196,31 @@ const updateClub = asyncHandler(async (req, res) => {
 // @route   DELETE /api/clubs/:id
 // @access  Private/Admin
 const deleteClub = asyncHandler(async (req, res) => {
-  const club = await prisma.club.findUnique({ where: { id: req.params.id } });
+  const clubId = req.params.id;
+
+  const club = await prisma.club.findUnique({ where: { id: clubId } });
   if (!club) {
     res.status(404);
     throw new Error("Club not found");
   }
-  await prisma.club.delete({ where: { id: req.params.id } });
+
+  // A club can't be deleted while other rows still reference it (the DB
+  // enforces this as a foreign-key restriction). Check first and return a
+  // clear message instead of letting Prisma throw an opaque 500.
+  const [matchCount, memberCount] = await Promise.all([
+    prisma.match.count({ where: { club: clubId } }),
+    prisma.user.count({ where: { memberOf: clubId } }),
+  ]);
+
+  if (matchCount > 0 || memberCount > 0) {
+    const parts = [];
+    if (matchCount > 0) parts.push(`${matchCount} match${matchCount === 1 ? "" : "es"}`);
+    if (memberCount > 0) parts.push(`${memberCount} member${memberCount === 1 ? "" : "s"}`);
+    res.status(409);
+    throw new Error(`Cannot delete "${club.clubName}" while it still has ${parts.join(" and ")}. Remove them first, then delete the club.`);
+  }
+
+  await prisma.club.delete({ where: { id: clubId } });
   res.json({ message: "Club deleted successfully" });
 });
 
