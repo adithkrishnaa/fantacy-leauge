@@ -68,6 +68,8 @@ model Match {
   manager                     String
   prizeShareStatus            Boolean   @default(false)
   result                      String?
+  Team1Players                Json      @default("{}")
+  Team2Players                Json      @default("{}")
   createdAt                   DateTime  @default(now())
   Bet                         Bet[]
   Group                       Group[]

@@ -1,5 +1,6 @@
 const asyncHandler = require('express-async-handler');
 const prisma = require('../config/prisma');
+const { assertMatchOwnership } = require('../utils/ownershipPolicy');
 
 // @desc    Create a new group
 // @route   POST /api/groups
@@ -12,6 +13,7 @@ const createGroup = asyncHandler(async (req, res) => {
     res.status(404);
     throw new Error('Match not found');
   }
+  assertMatchOwnership(req.user, match);
 
   if (betType === 'Bidding Method' && (!minimumIncrement || isNaN(minimumIncrement))) {
     res.status(400);
@@ -87,6 +89,7 @@ const updateGroup = asyncHandler(async (req, res) => {
     res.status(404);
     throw new Error('Match not found');
   }
+  assertMatchOwnership(req.user, match);
 
   if (betType === 'Bidding Method' && (!minimumIncrement || isNaN(minimumIncrement))) {
     res.status(400);
@@ -124,6 +127,13 @@ const deleteGroup = asyncHandler(async (req, res) => {
     res.status(404);
     throw new Error('Group not found');
   }
+
+  const match = await prisma.match.findUnique({ where: { id: group.match } });
+  if (!match) {
+    res.status(404);
+    throw new Error('Match not found');
+  }
+  assertMatchOwnership(req.user, match);
 
   // Cascade delete the group and refund any OPEN (unsettled) bets. A bet is
   // open when its result is still null — settled Win/Loss bets were already

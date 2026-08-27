@@ -2,6 +2,11 @@ const asyncHandler = require('express-async-handler');
 const prisma = require('../config/prisma');
 const axios = require('axios');
 const { addToWhatsappQueue } = require('../services/queueService');
+const { buildPlayerUpdate } = require('../utils/playerFields');
+const { assertMatchOwnership } = require('../utils/ownershipPolicy');
+const { assertResultExistsForPayout } = require('../utils/resultPolicy');
+const { calculateHouseShares } = require('../utils/payoutShares');
+const { calculateReferralWinCommission } = require('../utils/referralReward');
 
 // @desc    Add a new match
 // @route   POST /api/matches
@@ -168,9 +173,7 @@ const updatePlayers = asyncHandler(async (req, res) => {
 
   const updatedMatch = await prisma.match.update({
     where: { id: matchId },
-    data: {
-      // If team players exist in model
-    }
+    data: buildPlayerUpdate(team1Players, team2Players)
   });
   res.json({ ...updatedMatch, _id: updatedMatch.id });
 });
@@ -373,6 +376,9 @@ const approveCredits = asyncHandler(async (req, res) => {
       throw new Error('Match not found');
     }
 
+    assertMatchOwnership(req.user, match);
+    assertResultExistsForPayout(match);
+
     if (match.status !== 'Ongoing') {
       res.status(400);
       throw new Error('Match results must be announced before approving credits');
@@ -483,8 +489,8 @@ const approveCredits = asyncHandler(async (req, res) => {
             let referralBonus = 0;
             let netWinnings = amountPerWinner;
 
-            if (user.referredBy && user.userType === 'Member') {
-              referralBonus = amountPerWinner * 0.05;
+            referralBonus = calculateReferralWinCommission(amountPerWinner);
+            if (referralBonus > 0 && user.referredBy && user.userType === 'Member') {
               netWinnings = amountPerWinner - referralBonus;
 
               await tx.user.update({
@@ -672,9 +678,9 @@ const approveCredits = asyncHandler(async (req, res) => {
       });
 
       const remainingAmount = totalBetAmount - (firstPrize + secondPrize + thirdPrize);
-      const adminSharePct = match.Club ? match.Club.adminShare || 0 : 0;
-      const adminShare = (remainingAmount * adminSharePct) / 100;
-      const managerShare = remainingAmount - adminShare;
+      const adminWeight = group.adminShare || 0;
+      const managerWeight = group.managerShare || 0;
+      const { adminShare, managerShare } = calculateHouseShares(remainingAmount, adminWeight, managerWeight);
 
       if (adminShare > 0 && admin) {
         await tx.user.update({
@@ -690,7 +696,7 @@ const approveCredits = asyncHandler(async (req, res) => {
             user: admin.id,
             amount: adminShare,
             type: "Credit",
-            description: `Admin Share (${adminSharePct}%) for ${match.team1} vs ${match.team2} - group: ${group.id}`,
+            description: `Admin Share (weight ${adminWeight}) for ${match.team1} vs ${match.team2} - group: ${group.id}`,
           }
         });
       }
@@ -709,7 +715,7 @@ const approveCredits = asyncHandler(async (req, res) => {
             user: manager.id,
             amount: managerShare,
             type: "Credit",
-            description: `Manager Share for ${match.team1} vs ${match.team2} - group: ${group.id}`,
+            description: `Manager Share (weight ${managerWeight}) for ${match.team1} vs ${match.team2} - group: ${group.id}`,
           }
         });
       }
@@ -779,7 +785,7 @@ msgid: ${msgId}
   } catch (error) {
     console.error("Error approving credits:", error);
     const alreadyDone = /already completed/i.test(error.message || '');
-    res.status(alreadyDone ? 409 : 500).json({
+    res.status(alreadyDone ? 409 : (error.statusCode || 500)).json({
       success: false,
       error: alreadyDone ? error.message : "Internal Server Error",
       details: error.message

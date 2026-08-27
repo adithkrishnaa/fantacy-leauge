@@ -1,6 +1,7 @@
 const asyncHandler = require("express-async-handler");
 const prisma = require("../config/prisma");
 const { addToWhatsappQueue } = require('../services/queueService');
+const { assertTransactionReadAccess } = require('../utils/transactionAccess');
 
 // @desc    Add a new transaction
 // @route   POST /api/transactions
@@ -78,6 +79,7 @@ Thank you for using FantasyLeague7!
 // @access  Private
 const getTransactionsByUser = asyncHandler(async (req, res) => {
   const { userId } = req.params;
+  assertTransactionReadAccess(req.user, userId);
   const transactions = await prisma.transaction.findMany({
     where: { user: userId },
     orderBy: { createdAt: 'desc' }

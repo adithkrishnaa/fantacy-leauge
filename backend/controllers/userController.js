@@ -6,6 +6,9 @@ const validator = require('validator');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
 const { addToWhatsappQueue } = require('../services/queueService');
+const { generateUniqueReferralCode, ensureUserReferralCode } = require('../utils/referralCode');
+const { assertMemberOwnership } = require('../utils/ownershipPolicy');
+const { applyRegistrationReferralReward } = require('../utils/referralReward');
 
 // @desc    Register new user
 // @route   POST /api/users/register
@@ -35,31 +38,35 @@ const registerUser = asyncHandler(async (req, res) => {
 
   const hashedPassword = await bcrypt.hash(password, 10);
   const userId = require('crypto').randomUUID();
+  const newUserReferralCode = await generateUniqueReferralCode(prisma.user);
 
-  const user = await prisma.user.create({
-    data: {
-      id: userId,
-      firstName,
-      lastName: lastName || '',
-      email: email || null,
-      countryCode: countryCode || '+91',
-      phoneNumber: cleanedPhoneNumber,
-      password: hashedPassword,
-      referredBy: referredBy || null,
-      userType: 'Member',
+  const user = await prisma.$transaction(async (tx) => {
+    const createdUser = await tx.user.create({
+      data: {
+        id: userId,
+        firstName,
+        lastName: lastName || '',
+        email: email || null,
+        countryCode: countryCode || '+91',
+        phoneNumber: cleanedPhoneNumber,
+        password: hashedPassword,
+        referralCode: newUserReferralCode,
+        referredBy: referredBy || null,
+        userType: 'Member',
+      }
+    });
+    if (referredBy) {
+      await applyRegistrationReferralReward(tx.user, tx.transaction, {
+        referrerId: referredBy,
+        newMemberName: `${firstName} ${lastName || ''}`.trim(),
+        transactionId: require('crypto').randomUUID(),
+      });
     }
+    return createdUser;
   });
 
   if (user) {
     try {
-      // Update referrer's count if applicable
-      if (referredBy) {
-        await prisma.user.update({
-          where: { id: referredBy },
-          data: { referralCount: { increment: 1 } }
-        });
-      }
-
       // Send welcome message to the new user
       const welcomeMessage = `
 🎉 *Welcome to Fantasy League 7!*
@@ -414,6 +421,7 @@ const registerMember = asyncHandler(async (req, res) => {
     const ManagerNumber = club.managerPhone;
     const hashedPassword = await bcrypt.hash(password, 10);
     const userId = require('crypto').randomUUID();
+    const referralCode = await generateUniqueReferralCode(prisma.user);
 
     const user = await prisma.user.create({
       data: {
@@ -424,6 +432,7 @@ const registerMember = asyncHandler(async (req, res) => {
         countryCode: countryCode || '+91',
         phoneNumber,
         password: hashedPassword,
+        referralCode,
         userType: 'Member',
         memberOf: club.id,
       }
@@ -508,6 +517,7 @@ const AdminregisterMember = asyncHandler(async (req, res) => {
     const ManagerNumber = club.managerPhone;
     const hashedPassword = await bcrypt.hash(password, 10);
     const userId = require('crypto').randomUUID();
+    const referralCode = await generateUniqueReferralCode(prisma.user);
 
     const user = await prisma.user.create({
       data: {
@@ -518,6 +528,7 @@ const AdminregisterMember = asyncHandler(async (req, res) => {
         countryCode: countryCode || '+91',
         phoneNumber,
         password: hashedPassword,
+        referralCode,
         userType: 'Member',
         memberOf: club.id,
       }
@@ -622,6 +633,12 @@ const addCredit = asyncHandler(async (req, res) => {
       throw new Error('Member not found');
     }
 
+
+    const managerClub = req.user.userType === 'Manager'
+      ? await prisma.club.findUnique({ where: { user: req.user._id } })
+      : null;
+    assertMemberOwnership(req.user, managerClub, member);
+
     const amount = parseFloat(creditAmount);
     const updatedMember = await prisma.user.update({
       where: { id: memberId },
@@ -675,7 +692,7 @@ Thank you for using FantasyLeague7!
 
   } catch (error) {
     console.error("Error adding credit:", error);
-    res.status(500).json({ 
+    res.status(error.statusCode || 500).json({
       error: "Internal Server Error", 
       details: error.message 
     });
@@ -693,6 +710,11 @@ const removeMember = asyncHandler(async (req, res) => {
     res.status(404);
     throw new Error('Member not found');
   }
+
+  const managerClub = req.user.userType === 'Manager'
+    ? await prisma.club.findUnique({ where: { user: req.user._id } })
+    : null;
+  assertMemberOwnership(req.user, managerClub, member);
 
   await prisma.user.update({
     where: { id: memberId },
@@ -720,6 +742,12 @@ const deductCredit = asyncHandler(async (req, res) => {
       res.status(404);
       throw new Error('Member not found');
     }
+
+
+    const managerClub = req.user.userType === 'Manager'
+      ? await prisma.club.findUnique({ where: { user: req.user._id } })
+      : null;
+    assertMemberOwnership(req.user, managerClub, member);
 
     const amount = parseFloat(creditAmount);
     if (member.credits < amount) {
@@ -958,11 +986,15 @@ const getReferralStats = asyncHandler(async (req, res) => {
   });
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { referralCode: true, referralCount: true, referralEarnings: true }
+    select: { id: true, userType: true, referralCode: true, referralCount: true, referralEarnings: true }
   });
+
+  const referralCode = user && user.userType === 'Member'
+    ? await ensureUserReferralCode(prisma.user, user)
+    : user?.referralCode || null;
   
   res.json({
-    referralCode: user ? user.referralCode : null,
+    referralCode,
     referralCount: user ? user.referralCount : 0,
     referralEarnings: user ? user.referralEarnings : 0,
     referredUsers
@@ -979,12 +1011,16 @@ const sendWhatsAppInvite = asyncHandler(async (req, res) => {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { referralCode: true, firstName: true, lastName: true }
+      select: { id: true, userType: true, referralCode: true, firstName: true, lastName: true }
     });
     if (!user) {
       res.status(404);
       throw new Error('User not found');
     }
+
+    const referralCode = user.userType === 'Member'
+      ? await ensureUserReferralCode(prisma.user, user)
+      : user.referralCode;
 
     const cleanedPhoneNumber = phoneNumber.replace(/\s/g, '');
     if (!/^\d{10,15}$/.test(cleanedPhoneNumber)) {
@@ -992,7 +1028,7 @@ const sendWhatsAppInvite = asyncHandler(async (req, res) => {
       throw new Error('Invalid phone number format');
     }
 
-    const referralLink = `https://fantacyleauge.com/register?ref=${user.referralCode}`;
+    const referralLink = `https://fantacyleauge.com/register?ref=${referralCode}`;
     
     const message = `
 🌟 *You're Invited to FantasyLeague7!* 🌟

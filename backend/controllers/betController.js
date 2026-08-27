@@ -1,6 +1,7 @@
 const asyncHandler = require('express-async-handler');
 const prisma = require('../config/prisma');
 const { addToWhatsappQueue } = require('../services/queueService');
+const { validateBetContext } = require('../utils/betPolicy');
 
 // @desc    Place multiple new bets
 // @route   POST /api/bets/multiple
@@ -32,7 +33,8 @@ const placeMultipleBets = asyncHandler(async (req, res) => {
       throw new Error('User not found');
     }
 
-    const totalAmount = parseFloat(betAmount) * combinations.length;
+    const amount = parseFloat(betAmount);
+    const totalAmount = amount * combinations.length;
 
     if (user.credits < totalAmount) {
       res.status(400);
@@ -44,6 +46,8 @@ const placeMultipleBets = asyncHandler(async (req, res) => {
       res.status(404);
       throw new Error('Match not found');
     }
+
+    validateBetContext({ amount, user, match, group });
 
     const combinationRegex = /^[1-7A-G]{3}$/;
     for (const comb of combinations) {
@@ -97,7 +101,7 @@ const placeMultipleBets = asyncHandler(async (req, res) => {
 
       betsToCreate.push({
         id: require('crypto').randomUUID(),
-        betAmount: parseFloat(betAmount),
+        betAmount: amount,
         match: matchId,
         group: groupId,
         better: userId,
@@ -105,20 +109,35 @@ const placeMultipleBets = asyncHandler(async (req, res) => {
       });
     }
 
-    await prisma.group.update({
-      where: { id: groupId },
-      data: {
-        CombinationsMaster: updatedMaster,
-        SelectedCombinations: updatedSelected,
-        totalBetAmount: { increment: totalAmount }
+    const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
+    const { updatedUser, transaction } = await prisma.$transaction(async (tx) => {
+      const debited = await tx.user.updateMany({
+        where: { id: userId, credits: { gte: totalAmount } },
+        data: { credits: { decrement: totalAmount } }
+      });
+      if (debited.count !== 1) {
+        const error = new Error('Insufficient credits');
+        error.statusCode = 400;
+        throw error;
       }
-    });
-
-    await prisma.bet.createMany({ data: betsToCreate });
-
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: { credits: { decrement: totalAmount } }
+      await tx.group.update({
+        where: { id: groupId },
+        data: {
+          CombinationsMaster: updatedMaster,
+          SelectedCombinations: updatedSelected,
+          totalBetAmount: { increment: totalAmount }
+        }
+      });
+      await tx.bet.createMany({ data: betsToCreate });
+      const transaction = await tx.transaction.create({
+        data: {
+          id: require('crypto').randomUUID(), transactionId: txnCode, user: userId,
+          amount: totalAmount, type: 'Debit',
+          description: `RS ${totalAmount.toFixed(2)} Bet placed in ${match.team1} vs ${match.team2} on ${combinations.length} combinations`
+        }
+      });
+      const updatedUser = await tx.user.findUnique({ where: { id: userId } });
+      return { updatedUser, transaction };
     });
 
     const matchDate = new Date(match.dateTime).toLocaleString('en-IN', {
@@ -141,18 +160,6 @@ const placeMultipleBets = asyncHandler(async (req, res) => {
 
 🤞 Good luck! May your combinations win!
     `.trim();
-
-    const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-    const transaction = await prisma.transaction.create({
-      data: {
-        id: require('crypto').randomUUID(),
-        transactionId: txnCode,
-        user: userId,
-        amount: totalAmount,
-        type: 'Debit',
-        description: `RS ${totalAmount.toFixed(2)} Bet placed in ${match.team1} vs ${match.team2} on ${combinations.length} combinations`
-      }
-    });
 
     const debitMessage = `
 💸 **Transaction Alert - Debit**
@@ -193,9 +200,10 @@ Thank you for using FantacyLeague7!
 
   } catch (error) {
     console.error("Error placing multiple bets:", error);
-    res.status(500).json({ 
+    res.status(error.statusCode || (res.statusCode !== 200 ? res.statusCode : 500)).json({
       success: false,
-      error: "Internal Server Error", 
+      message: error.message,
+      error: error.message,
       details: error.message 
     });
   }
@@ -233,6 +241,8 @@ const placeBet = asyncHandler(async (req, res) => {
       throw new Error('Match not found');
     }
 
+    validateBetContext({ amount, user, match, group });
+
     const combinationRegex = /^[1-7A-G]{3}$/;
     if (!combinationRegex.test(combination)) {
       res.status(400);
@@ -265,42 +275,51 @@ const placeBet = asyncHandler(async (req, res) => {
       }
     }
 
+    let groupUpdate;
     if (group.betType === 'First Better' && isInMasterCombinations) {
       updatedMaster = updatedMaster.filter(c => c !== newCombination);
       updatedSelected.push(newCombination);
-
-      await prisma.group.update({
-        where: { id: groupId },
-        data: {
-          CombinationsMaster: updatedMaster,
-          SelectedCombinations: updatedSelected,
-          totalBetAmount: { increment: amount }
-        }
-      });
+      groupUpdate = {
+        CombinationsMaster: updatedMaster,
+        SelectedCombinations: updatedSelected,
+        totalBetAmount: { increment: amount }
+      };
     } else {
-      await prisma.group.update({
-        where: { id: groupId },
-        data: {
-          totalBetAmount: { increment: amount }
-        }
-      });
+      groupUpdate = { totalBetAmount: { increment: amount } };
     }
 
     const betId = require('crypto').randomUUID();
-    const bet = await prisma.bet.create({
-      data: {
+    const betData = {
         id: betId,
         betAmount: amount,
         match: matchId,
         group: groupId,
         better: userId,
         combination,
-      }
-    });
+    };
 
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: { credits: { decrement: amount } }
+    const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
+    const { bet, updatedUser, transaction } = await prisma.$transaction(async (tx) => {
+      const debited = await tx.user.updateMany({
+        where: { id: userId, credits: { gte: amount } },
+        data: { credits: { decrement: amount } }
+      });
+      if (debited.count !== 1) {
+        const error = new Error('Insufficient credits');
+        error.statusCode = 400;
+        throw error;
+      }
+      await tx.group.update({ where: { id: groupId }, data: groupUpdate });
+      const bet = await tx.bet.create({ data: betData });
+      const transaction = await tx.transaction.create({
+        data: {
+          id: require('crypto').randomUUID(), transactionId: txnCode, user: userId,
+          amount, type: 'Debit',
+          description: `RS ${amount.toFixed(2)} Bet placed in ${match.team1} vs ${match.team2} on ${combination}`
+        }
+      });
+      const updatedUser = await tx.user.findUnique({ where: { id: userId } });
+      return { bet, updatedUser, transaction };
     });
 
     const matchDate = new Date(match.dateTime).toLocaleString('en-IN', {
@@ -323,18 +342,6 @@ const placeBet = asyncHandler(async (req, res) => {
 
 🤞 Good luck! May your combination win!
     `.trim();
-
-    const txnCode = `TXN-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-    const transaction = await prisma.transaction.create({
-      data: {
-        id: require('crypto').randomUUID(),
-        transactionId: txnCode,
-        user: userId,
-        amount: amount,
-        type: 'Debit',
-        description: `RS ${amount.toFixed(2)} Bet placed in ${match.team1} vs ${match.team2} on ${combination}`
-      }
-    });
 
     const debitMessage = `
 💸 **Transaction Alert - Debit**
@@ -375,9 +382,10 @@ Thank you for using FantacyLeague7!
 
   } catch (error) {
     console.error("Error placing bet:", error);
-    res.status(500).json({ 
+    res.status(error.statusCode || (res.statusCode !== 200 ? res.statusCode : 500)).json({
       success: false,
-      error: "Internal Server Error", 
+      message: error.message,
+      error: error.message,
       details: error.message 
     });
   }
