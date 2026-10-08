@@ -8,6 +8,39 @@ requests with no `Origin` header.
 
 All three roles are supported: **Member**, **Manager** and **Admin**.
 
+## Embedded-backend mode (no server)
+
+The app can also run the backend itself: `lib/backend/` is a Dart port of the
+Express controllers that talks straight to the shared Postgres database. Web
+and app users share the same data, and passwords stay bcrypt-compatible.
+`ApiClient` routes every call there when the build defines `DATABASE_URL`.
+
+> **Personal testing only.** The database connection string is compiled into
+> the APK and can be extracted by anyone who has the file, giving them full
+> read/write access to the database. Never share such an APK. For a build you
+> hand out, host `backend/` instead and use HTTP mode below.
+
+1. Create `mobile/backend.env.json` (git-ignored) with the same URL as
+   `backend/.env`:
+
+   ```json
+   { "DATABASE_URL": "postgres://...@pooled.db.prisma.io:5432/postgres?sslmode=verify-full" }
+   ```
+
+2. Build:
+
+   ```bash
+   cd mobile && flutter build apk --release --dart-define-from-file=backend.env.json
+   ```
+
+Tests for this mode:
+
+- `test/embedded_backend_smoke_test.dart`: read-only checks against the real
+  DB (`--dart-define-from-file=backend.env.json`).
+- `test/embedded_backend_flow_test.dart`: a full lifecycle of register, club,
+  credits, bets, result, payout and refunds. It writes data, so it only runs
+  against a local throwaway Postgres (instructions in the file header).
+
 ## Running against the local backend
 
 1. Start the API (from the repo root):

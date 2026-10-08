@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../backend/local_backend.dart';
 import '../config/api_config.dart';
 
 /// Thrown for any non-2xx response, carrying the backend's message.
@@ -74,15 +75,25 @@ class ApiClient {
   }
 
   Future<dynamic> get(String path, {Map<String, dynamic>? query}) =>
-      _send(() => _dio.get(path, queryParameters: query));
+      ApiConfig.embedded
+          ? _local('GET', path)
+          : _send(() => _dio.get(path, queryParameters: query));
 
-  Future<dynamic> post(String path, {Object? body}) =>
-      _send(() => _dio.post(path, data: body));
+  Future<dynamic> post(String path, {Object? body}) => ApiConfig.embedded
+      ? _local('POST', path, body)
+      : _send(() => _dio.post(path, data: body));
 
-  Future<dynamic> put(String path, {Object? body}) =>
-      _send(() => _dio.put(path, data: body));
+  Future<dynamic> put(String path, {Object? body}) => ApiConfig.embedded
+      ? _local('PUT', path, body)
+      : _send(() => _dio.put(path, data: body));
 
-  Future<dynamic> delete(String path) => _send(() => _dio.delete(path));
+  Future<dynamic> delete(String path) => ApiConfig.embedded
+      ? _local('DELETE', path)
+      : _send(() => _dio.delete(path));
+
+  /// Embedded mode: run the request against the in-app backend.
+  Future<dynamic> _local(String method, String path, [Object? body]) =>
+      LocalBackend.instance.handle(method, path, body: body, token: _token);
 
   Future<dynamic> _send(Future<Response<dynamic>> Function() request) async {
     try {
